@@ -97,14 +97,16 @@ def load_smchn(tag, obs_len, pred_len, device):
     saved = ckpt.get('args', {})
     if not saved:
         print('  ⚠ Το checkpoint δεν έχει saved["args"] — χρησιμοποιούνται '
-              'προεπιλογές (embedding_dims=64, number_gcn_layers=1, '
-              'num_heads=4). Επιβεβαίωσε ότι ταιριάζουν με το training config.')
+              'προεπιλογές. Επιβεβαίωσε ότι ταιριάζουν με το training config.')
     m = TrajectoryModel(
-        obs_len=obs_len, pred_len=pred_len,
-        embedding_dims=saved.get('embedding_dims', 64),
-        number_gcn_layers=saved.get('number_gcn_layers', 1),
-        dropout=0,
-        num_heads=saved.get('num_heads', 4),
+        number_asymmetric_conv_layer = saved.get('number_asymmetric_conv_layer', 2),
+        embedding_dims               = saved.get('embedding_dims', 64),
+        number_gcn_layers            = saved.get('number_gcn_layers', 1),
+        dropout                      = 0.0,
+        obs_len                      = saved.get('obs_len', obs_len),
+        pred_len                     = saved.get('pred_len', pred_len),
+        out_dims                     = 5,
+        num_heads                    = saved.get('num_heads', 4),
     ).to(device)
     m.load_state_dict(ckpt['model'])
     m.eval()
@@ -112,29 +114,51 @@ def load_smchn(tag, obs_len, pred_len, device):
     return m
 
 
-def obs_to_smchn_graph(obs, mask):
+def make_identity(T: int, N: int, device):
+    """Ίδιο με evaluate_smchn.py: self-connection identity matrices,
+    repeated κατά μήκος της άλλης διάστασης (broadcast μέσω πολλαπλασιασμού
+    με πίνακα άσσων)."""
+    identity_spatial  = torch.ones((T, N, N), device=device) * torch.eye(N, device=device)
+    identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
+    return [identity_spatial, identity_temporal]
+
+
+def obs_to_smchn_graph(obs, mask, min_vessels=2):
     """
-    ΠΡΟΣΩΡΙΝΟ PLACEHOLDER — ΔΕΝ είναι έτοιμο για χρήση.
+    Μετατρέπει ένα (obs, mask) batch από την AISDataset στο input format
+    που περιμένει το model_smchn.TrajectoryModel.forward(graph, identity).
 
-    model_smchn.TrajectoryModel.forward(graph, identity) περιμένει:
-      graph:    [1, obs_len, N, 5]  = [pos_enc, LON_rel, LAT_rel, SOG_rel, Heading_rel]
-      identity: (spatial_identity [T,N,N], temporal_identity [N,T,T])
+    Ίδια λογική με evaluate_smchn.py:window_to_smchn_inputs(), χωρίς το
+    κομμάτι του pred_gt/last_obs_pos που χρειάζεται μόνο για μετρικές.
 
-    Το AISDataset δίνει obs [B, N, obs_len, 4] = [LON, LAT, SOG, Heading] (z-score,
-    ΟΧΙ relative), χωρίς pos_enc και χωρίς τα identity tensors.
+    obs:  [1, N, T_obs, 4]  (LON, LAT, SOG, Heading — z-score) — batch_size=1
+    mask: [1, N] bool
 
-    Η ακριβής μετατροπή (τύπος pos_enc, τρόπος υπολογισμού *_rel, κατασκευή
-    identity matrices) καθορίζεται στο evaluate_smchn.py / train_smchn.py, τα
-    οποία δεν είναι διαθέσιμα σε αυτό το project. ΜΗΝ μαντέψεις εδώ — καλύτερα
-    να σκάσει καθαρά παρά να μετρήσει λάθος tensors σιωπηλά.
-
-    Δώσε το evaluate_smchn.py για να συμπληρωθεί σωστά αυτή η συνάρτηση.
+    Returns: (V_obs, identity) ή None αν N_valid < min_vessels
+        V_obs:    [1, T_obs, N_valid, 5] = [pos_idx, ΔLON, ΔLAT, ΔSOG, ΔHeading]
+        identity: [spatial (T,N_valid,N_valid), temporal (N_valid,T,T)]
     """
-    raise NotImplementedError(
-        'obs_to_smchn_graph() δεν έχει υλοποιηθεί ακόμα — χρειάζεται το '
-        'evaluate_smchn.py / train_smchn.py για τη σωστή μετατροπή '
-        '(obs,mask) -> (graph,identity). Μέχρι τότε τρέξε με --skip_smchn.'
-    )
+    device = obs.device
+    valid   = mask[0]
+    N_valid = int(valid.sum().item())
+    if N_valid < min_vessels:
+        return None
+
+    obs_b = obs[0, valid]              # [N_valid, T_obs, 4]
+    T_obs = obs_b.shape[1]
+
+    abs_obs = obs_b.permute(1, 0, 2)   # [T_obs, N_valid, 4]
+    rel_obs = torch.zeros_like(abs_obs)
+    rel_obs[1:] = abs_obs[1:] - abs_obs[:-1]   # per-step displacement, t=0 → 0
+
+    # pos_enc = 1-indexed timestep (ΟΧΙ sinusoidal — απλός γραμμικός δείκτης)
+    pos_idx = torch.arange(1, T_obs + 1, device=device, dtype=torch.float32)
+    pos_idx = pos_idx.view(T_obs, 1, 1).expand(T_obs, N_valid, 1)
+
+    V_obs = torch.cat([pos_idx, rel_obs], dim=-1).unsqueeze(0)  # [1, T_obs, N_valid, 5]
+
+    identity = make_identity(T_obs, N_valid, device)
+    return V_obs, identity
 
 
 def sync(device):
@@ -172,7 +196,13 @@ def measure(model, batches, device, n_warmup=10, n_measure=50, call_fn=default_c
 
 
 def smchn_call(model, obs, mask):
-    graph, identity = obs_to_smchn_graph(obs, mask)
+    result = obs_to_smchn_graph(obs, mask)
+    if result is None:
+        raise RuntimeError(
+            'Σκηνή με λιγότερα από min_vessels πλοία — δεν έπρεπε να συμβεί '
+            'αφού η AISDataset ήδη φιλτράρει με min_vessels=3.'
+        )
+    graph, identity = result
     return model(graph, identity)
 
 
