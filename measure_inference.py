@@ -136,7 +136,7 @@ def main():
         smchn.load_state_dict(ckpt['model'])
         smchn.eval()
         print(f'  Loaded SMCHN_obs10_pred10_s42  (epoch {ckpt["epoch"]})')
-        ms, sd = measure(smchn, batches, device, use_mask=True,
+        ms, sd = measure(smchn, batches, device, use_mask=False,
                          n_warmup=args.n_warmup, n_measure=args.n_measure)
         results['SMCHN'] = (ms, sd)
         del smchn
