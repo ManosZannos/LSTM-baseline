@@ -5,6 +5,7 @@ Identical setup to train_lstm.py for fair comparison.
 
 Usage:
     python train_cpagrn.py --obs_len 5 --pred_len 5 --tag CPAGRN_obs5_pred5_s42
+    python train_cpagrn.py --obs_len 10 --pred_len 10 --seed 123 --tag CPAGRN_obs10_pred10_s123
 """
 
 from __future__ import annotations
@@ -37,6 +38,7 @@ def get_args():
     p.add_argument('--gpu_num',        type=int,   default=0)
     p.add_argument('--tag',            type=str,   default='CPAGRN_obs5_pred5')
     p.add_argument('--log_every',      type=int,   default=10)
+    p.add_argument('--seed',           type=int,   default=42)
     return p.parse_args()
 
 
@@ -79,9 +81,9 @@ def run_epoch(loader, model, optimizer, device, args, stats, train: bool):
 
 def main():
     args = get_args()
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-    np.random.seed(42)
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_num)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
