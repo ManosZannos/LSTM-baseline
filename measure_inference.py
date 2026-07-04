@@ -116,13 +116,12 @@ def main():
     # 3. CPA-GRN v4
     print('\nTiming CPA-GRN v4...')
     cpagrn = load_cpagrn('CPAGRN_obs10_pred10_s42', args.pred_len, device)
-    ms, sd = measure(smchn, batches, device, use_mask=False,
-                         n_warmup=args.n_warmup, n_measure=args.n_measure)
-    
+    ms, sd = measure(cpagrn, batches, device, use_mask=True,
+                     n_warmup=args.n_warmup, n_measure=args.n_measure)
     results['CPA-GRN v4'] = (ms, sd)
     del cpagrn
 
-   # 4. SMCHN
+    # 4. SMCHN
     print('\nTiming SMCHN...')
     try:
         from model_smchn import TrajectoryModel
