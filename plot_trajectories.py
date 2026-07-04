@@ -12,15 +12,19 @@ plot_trajectories.py — Ποιοτική ανάλυση: εντοπισμός �
     μη-αλληλεπιδρώντα σενάρια.
 
 Μέθοδος εντοπισμού:
-    Υπολογίζεται DCPA/TCPA (ίδιος τύπος με CPAFeatures του model_cpagrn.py)
-    για κάθε ζεύγος πλοίων, στο τελευταίο παρατηρούμενο timestep κάθε
-    σκηνής του test set, ΧΩΡΙΣ να χρειαστεί να φορτωθεί κανένα μοντέλο
-    (καθαρά γεωμετρικός υπολογισμός πάνω στα raw δεδομένα). Κρατάμε τα
-    ζεύγη με:
+    Υπολογίζεται DCPA/TCPA (ίδιος μαθηματικός τύπος με το CPAFeatures του
+    model_cpagrn.py, αλλά εδώ σε πραγματικές μονάδες — nm, λεπτά — αντί
+    για τον εσωτερικό z-score χώρο του μοντέλου, ώστε το κριτήριο επιλογής
+    σκηνής να είναι φυσικά ερμηνεύσιμο) για κάθε ζεύγος πλοίων, στο
+    τελευταίο παρατηρούμενο timestep κάθε σκηνής του test set, ΧΩΡΙΣ να
+    χρειαστεί να φορτωθεί κανένα μοντέλο. Κρατάμε τα ζεύγη με:
       - θετικό TCPA εντός εύλογου εύρους (πραγματική μελλοντική σύγκλιση,
         όχι ήδη περασμένη προσέγγιση ή εξωπραγματικά μακρινή),
-      - επαρκή ταχύτητα και για τα δύο πλοία (αποφυγή artifacts από σχεδόν
-        ακίνητα πλοία όπου το TCPA γίνεται αριθμητικά ασταθές παρά το clamp),
+      - ΦΥΣΙΚΑ ΕΓΚΥΡΗ ταχύτητα (1–25 κόμβοι) και για τα δύο πλοία,
+        υπολογισμένη από την πραγματική μετατόπιση θέσης (όχι το πεδίο
+        SOG) — αποκλείει σπάνια artifacts/GPS-jumps του dataset που περνούν
+        το φιλτράρισμα SOG∈[0,22] της προεπεξεργασίας επειδή εκείνο ελέγχει
+        το πεδίο SOG, όχι τη συνέπεια της ίδιας της θέσης,
     και ταξινομούμε κατά αύξον DCPA (πιο επικίνδυνο σενάριο πρώτο).
 
 Usage:
@@ -44,10 +48,16 @@ from dataset import AISDataset, denorm
 
 # ── CPA γεωμετρία (ίδιος τύπος με model_cpagrn.CPAFeatures, σε numpy) ─────────
 
-def pairwise_dcpa_tcpa(pos: np.ndarray, vel: np.ndarray, eps: float = 1e-6):
+def pairwise_dcpa_tcpa(pos: np.ndarray, vel: np.ndarray, eps: float = 1e-6,
+                        tcpa_clamp=(-60.0, 60.0), dcpa_clamp=(0.0, 100.0)):
     """
-    pos, vel: [N, 2]  (z-score space, ίδιο convention με το μοντέλο)
-    Returns: dcpa [N,N], tcpa [N,N]  (ίδιο clamping με CPAFeatures)
+    pos, vel: [N, 2]  — οποιοδήποτε συνεπές σύστημα μονάδων (εδώ: nm, nm/min)
+    Returns: dcpa [N,N], tcpa [N,N]
+
+    Τα clamp bounds είναι πλατύτερα από αυτά του CPAFeatures στο
+    model_cpagrn.py (±5 / 0–10), επειδή εκείνα ήταν βαθμονομημένα για τον
+    z-score χώρο του μοντέλου. Εδώ δουλεύουμε σε πραγματικές μονάδες
+    (nm, λεπτά) για φυσικά ερμηνεύσιμα αποτελέσματα στο qualitative figure.
     """
     N = pos.shape[0]
     pos_i = pos[:, None, :]
@@ -59,22 +69,61 @@ def pairwise_dcpa_tcpa(pos: np.ndarray, vel: np.ndarray, eps: float = 1e-6):
     v = vel_j - vel_i
 
     v_sq = (v * v).sum(-1) + eps
-    tcpa = np.clip(-(r * v).sum(-1) / v_sq, -5.0, 5.0)
-    dcpa = np.clip(np.linalg.norm(r + tcpa[..., None] * v, axis=-1), 0.0, 10.0)
+    tcpa = np.clip(-(r * v).sum(-1) / v_sq, tcpa_clamp[0], tcpa_clamp[1])
+    dcpa = np.clip(np.linalg.norm(r + tcpa[..., None] * v, axis=-1), dcpa_clamp[0], dcpa_clamp[1])
     return dcpa, tcpa
 
 
-def find_convergence_scenes(test_ds, min_tcpa=0.5, max_tcpa=8.0,
-                             min_speed=0.05, scan_n=30):
+def to_local_nm(obs_np: np.ndarray, stats: dict):
+    """
+    Μετατρέπει το τελευταίο βήμα παρατήρησης μιας σκηνής σε τοπικές
+    επίπεδες συντεταγμένες ναυτικών μιλίων (nm), χρησιμοποιώντας το μέσο
+    γεωγραφικό πλάτος της σκηνής ως σημείο αναφοράς για τη διόρθωση
+    cos(lat) στο γεωγραφικό μήκος. Επιστρέφει επίσης την ταχύτητα (nm/min)
+    κάθε πλοίου στο τελευταίο 1-λεπτο διάστημα.
+
+    obs_np: [N, T_obs, 4] (z-score)
+    Returns: pos_nm [N,2], vel_nm [N,2]  (nm, nm/min)
+    """
+    lon_mean, lon_std = stats['LON']['mean'], stats['LON']['std']
+    lat_mean, lat_std = stats['LAT']['mean'], stats['LAT']['std']
+
+    lon_last = denorm(obs_np[:, -1, 0], lon_mean, lon_std)
+    lat_last = denorm(obs_np[:, -1, 1], lat_mean, lat_std)
+    lon_prev = denorm(obs_np[:, -2, 0], lon_mean, lon_std)
+    lat_prev = denorm(obs_np[:, -2, 1], lat_mean, lat_std)
+
+    lat_ref_rad = np.radians(lat_last.mean())
+    cos_lat = np.cos(lat_ref_rad)
+
+    x_last = lon_last * 60.0 * cos_lat
+    y_last = lat_last * 60.0
+    x_prev = lon_prev * 60.0 * cos_lat
+    y_prev = lat_prev * 60.0
+
+    pos_nm = np.stack([x_last, y_last], axis=-1)          # [N,2]
+    vel_nm = pos_nm - np.stack([x_prev, y_prev], axis=-1)  # nm per 1-min step
+
+    return pos_nm, vel_nm
+
+
+def find_convergence_scenes(test_ds, stats, min_tcpa=0.5, max_tcpa=8.0,
+                             min_speed_knots=1.0, max_speed_knots=25.0,
+                             scan_n=30):
     """
     Σαρώνει όλο το test set (χωρίς μοντέλα) και επιστρέφει τα scan_n σενάρια
-    με μικρότερο DCPA μεταξύ ενός ζεύγους πλοίων, υπό τους περιορισμούς
-    πραγματικής μελλοντικής σύγκλισης. scan_n είναι το μέγεθος της ΔΕΞΑΜΕΝΗΣ
-    υποψηφίων (candidate pool) — η τελική επιλογή για plotting γίνεται
-    ΞΕΧΩΡΙΣΤΑ, με δεύτερο κριτήριο (βλ. rank_by_cpa_advantage), ώστε να μην
-    διαλέγουμε τυφλά με μόνο κριτήριο DCPA.
+    με μικρότερο DCPA (σε nm) μεταξύ ενός ζεύγους πλοίων, υπό τους
+    περιορισμούς:
+      - πραγματική μελλοντική σύγκλιση (θετικό, εύλογο TCPA σε λεπτά),
+      - ΦΥΣΙΚΑ ΕΓΚΥΡΗ ταχύτητα και για τα δύο πλοία (βάσει πραγματικής
+        μετατόπισης θέσης, όχι το πεδίο SOG — αποκλείει GPS-jump artifacts).
 
-    Returns: list of dict {scene_idx, i, j, dcpa, tcpa}
+    Το DCPA/TCPA υπολογίζεται εδώ σε πραγματικές μονάδες (nm, λεπτά) μέσω
+    τοπικής επίπεδης προβολής, ΟΧΙ στον z-score χώρο που χρησιμοποιεί
+    εσωτερικά το μοντέλο — επιλογή που γίνεται σκόπιμα εδώ ώστε το κριτήριο
+    επιλογής σκηνής για το ποιοτικό figure να είναι φυσικά ερμηνεύσιμο.
+
+    Returns: list of dict {scene_idx, i, j, dcpa (nm), tcpa (min)}
     """
     candidates = []
     for idx in range(len(test_ds)):
@@ -83,16 +132,14 @@ def find_convergence_scenes(test_ds, min_tcpa=0.5, max_tcpa=8.0,
         if N < 2:
             continue
 
-        pos_last = obs[:, -1, :2]
-        pos_prev = obs[:, -2, :2]
-        vel_last = pos_last - pos_prev
+        pos_nm, vel_nm = to_local_nm(obs, stats)
+        speed_kn = np.linalg.norm(vel_nm, axis=-1) * 60.0     # nm/min → knots
 
-        speed = np.linalg.norm(vel_last, axis=-1)          # [N]
-        dcpa, tcpa = pairwise_dcpa_tcpa(pos_last, vel_last)  # [N,N] each
-
+        dcpa, tcpa = pairwise_dcpa_tcpa(pos_nm, vel_nm)        # dcpa: nm, tcpa: min
         np.fill_diagonal(dcpa, np.inf)
 
-        speed_ok = (speed[:, None] > min_speed) & (speed[None, :] > min_speed)
+        speed_ok = ((speed_kn[:, None] >= min_speed_knots) & (speed_kn[:, None] <= max_speed_knots) &
+                    (speed_kn[None, :] >= min_speed_knots) & (speed_kn[None, :] <= max_speed_knots))
         tcpa_ok  = (tcpa > min_tcpa) & (tcpa < max_tcpa)
         valid    = speed_ok & tcpa_ok
 
@@ -104,6 +151,7 @@ def find_convergence_scenes(test_ds, min_tcpa=0.5, max_tcpa=8.0,
         candidates.append({
             'scene_idx': idx, 'i': int(i), 'j': int(j),
             'dcpa': float(dcpa_masked[i, j]), 'tcpa': float(tcpa[i, j]),
+            'speed_i_kn': float(speed_kn[i]), 'speed_j_kn': float(speed_kn[j]),
         })
 
     candidates.sort(key=lambda c: c['dcpa'])
@@ -313,8 +361,7 @@ def plot_scene(result, i, j, dcpa, tcpa, out_path, include_smchn):
     ade_lstm_j = ade_degrees(lstm_lon, lstm_lat, gt_lon, gt_lat, j)
     ade_cpa_j  = ade_degrees(cpa_lon,  cpa_lat,  gt_lon, gt_lat, j)
 
-    title = (f'Σενάριο σύγκλισης — DCPA={dcpa:.4f}° TCPA={tcpa:.1f} min '
-             f'(z-score timesteps)\n'
+    title = (f'Σενάριο σύγκλισης — DCPA={dcpa:.2f} nm   TCPA={tcpa:.1f} min\n'
              f'ADE Πλοίο A: LSTM={ade_lstm_i:.5f}° CPA-GRN={ade_cpa_i:.5f}°   |   '
              f'ADE Πλοίο B: LSTM={ade_lstm_j:.5f}° CPA-GRN={ade_cpa_j:.5f}°')
     ax.set_title(title, fontsize=10)
@@ -350,7 +397,11 @@ def main():
                    help='Πόσα από τα καλύτερα (κατά πλεονέκτημα CPA-GRN) να αποθηκευτούν ως plots')
     p.add_argument('--min_tcpa',  type=float, default=0.5)
     p.add_argument('--max_tcpa',  type=float, default=8.0)
-    p.add_argument('--min_speed', type=float, default=0.05)
+    p.add_argument('--min_speed_knots', type=float, default=1.0,
+                   help='Ελάχιστη φυσικά αποδεκτή ταχύτητα (κόμβοι) και για τα δύο πλοία')
+    p.add_argument('--max_speed_knots', type=float, default=25.0,
+                   help='Μέγιστη φυσικά αποδεκτή ταχύτητα (κόμβοι) — συνεπές με SOG<=22kn '
+                        'της προεπεξεργασίας (§4.1.1.3), με μικρό περιθώριο ανοχής')
     p.add_argument('--include_smchn', action='store_true')
     args = p.parse_args()
 
@@ -369,10 +420,12 @@ def main():
                           stride=args.obs_len + args.pred_len)
     print(f'  Test set: {len(test_ds):,} σκηνές\n')
 
-    print(f'Αναζήτηση {args.scan_n} υποψήφιων σεναρίων σύγκλισης (καθαρά γεωμετρικά)...')
+    print(f'Αναζήτηση {args.scan_n} υποψήφιων σεναρίων σύγκλισης '
+          f'(γεωμετρικά, με φυσικό φίλτρο ταχύτητας {args.min_speed_knots}-{args.max_speed_knots} κόμβοι)...')
     candidates = find_convergence_scenes(
-        test_ds, min_tcpa=args.min_tcpa, max_tcpa=args.max_tcpa,
-        min_speed=args.min_speed, scan_n=args.scan_n,
+        test_ds, stats, min_tcpa=args.min_tcpa, max_tcpa=args.max_tcpa,
+        min_speed_knots=args.min_speed_knots, max_speed_knots=args.max_speed_knots,
+        scan_n=args.scan_n,
     )
     if not candidates:
         raise RuntimeError(
@@ -425,11 +478,12 @@ def main():
             'agg_lstm': agg_lstm, 'agg_cpa': agg_cpa,
         })
 
-    print(f'{"scene":>6} {"N":>4} {"DCPA":>7} {"TCPA":>6} | '
+    print(f'{"scene":>6} {"N":>4} {"DCPA":>7} {"TCPA":>6} {"spdA":>6} {"spdB":>6} | '
           f'{"pair LSTM":>10} {"pair CPA":>10} {"advantage":>10} | '
           f'{"scene LSTM":>11} {"scene CPA":>10}')
     for e in sorted(evaluated, key=lambda x: -x['advantage']):
-        print(f"{e['scene_idx']:>6} {e['N']:>4} {e['dcpa']:>7.4f} {e['tcpa']:>6.2f} | "
+        print(f"{e['scene_idx']:>6} {e['N']:>4} {e['dcpa']:>7.4f} {e['tcpa']:>6.2f} "
+              f"{e['speed_i_kn']:>6.1f} {e['speed_j_kn']:>6.1f} | "
               f"{(e['ade_lstm_i']+e['ade_lstm_j'])/2:>10.5f} "
               f"{(e['ade_cpa_i']+e['ade_cpa_j'])/2:>10.5f} "
               f"{e['advantage']:>+10.5f} | "
