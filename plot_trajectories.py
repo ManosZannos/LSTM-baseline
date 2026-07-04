@@ -1,258 +1,396 @@
 """
-plot_trajectories.py — Trajectory prediction visualization (predicted vs ground truth).
+plot_trajectories.py — Ποιοτική ανάλυση: εντοπισμός σεναρίου σύγκλισης
+(convergence scenario) στο test set και σχεδίαση τροχιών παρατήρησης /
+πραγματικής συνέχειας / πρόβλεψης, για LSTM vs CPA-GRN v4 (10min task).
 
-Finds the test-set scene where CPA-GRN has the largest ADE advantage over LSTM,
-then plots predicted vs ground truth for the top-3 most active vessels.
+Γιατί "σενάριο σύγκλισης";
+    Η κεντρική υπόθεση της εργασίας είναι ότι το CPA-GRN υπερτερεί ακριβώς
+    σε καταστάσεις όπου δύο πλοία έχουν μικρό DCPA / θετικό, εύλογο TCPA
+    (πραγματικός κίνδυνος μελλοντικής σύγκρουσης), όχι απλώς σε τυχαίες
+    σκηνές. Ένα τυχαίο σενάριο σχεδόν σίγουρα δεν θα δείξει οπτικά καμία
+    διαφορά, αφού και τα δύο μοντέλα κάνουν καλή δουλειά σε "εύκολα",
+    μη-αλληλεπιδρώντα σενάρια.
+
+Μέθοδος εντοπισμού:
+    Υπολογίζεται DCPA/TCPA (ίδιος τύπος με CPAFeatures του model_cpagrn.py)
+    για κάθε ζεύγος πλοίων, στο τελευταίο παρατηρούμενο timestep κάθε
+    σκηνής του test set, ΧΩΡΙΣ να χρειαστεί να φορτωθεί κανένα μοντέλο
+    (καθαρά γεωμετρικός υπολογισμός πάνω στα raw δεδομένα). Κρατάμε τα
+    ζεύγη με:
+      - θετικό TCPA εντός εύλογου εύρους (πραγματική μελλοντική σύγκλιση,
+        όχι ήδη περασμένη προσέγγιση ή εξωπραγματικά μακρινή),
+      - επαρκή ταχύτητα και για τα δύο πλοία (αποφυγή artifacts από σχεδόν
+        ακίνητα πλοία όπου το TCPA γίνεται αριθμητικά ασταθές παρά το clamp),
+    και ταξινομούμε κατά αύξον DCPA (πιο επικίνδυνο σενάριο πρώτο).
 
 Usage:
-    python plot_trajectories.py --gpu_num 0 --out trajectories.pdf
+    python plot_trajectories.py --gpu_num 0
+    python plot_trajectories.py --gpu_num 0 --include_smchn
+    python plot_trajectories.py --gpu_num 0 --top_n 5   # αποθηκεύει τα 5 καλύτερα υποψήφια σενάρια
 """
-import os, argparse
+from __future__ import annotations
+import os
+import json
+import argparse
+
 import numpy as np
-import matplotlib.pyplot as plt
-import matplotlib.patches as mpatches
 import torch
-from dataset import get_dataloaders, denorm
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+from dataset import AISDataset, denorm
 
 
-# ── Model loaders ─────────────────────────────────────────────────────────────
+# ── CPA γεωμετρία (ίδιος τύπος με model_cpagrn.CPAFeatures, σε numpy) ─────────
 
-def load_cpagrn(tag, pred_len, device):
-    from model_cpagrn import CPAGRN
-    ckpt = torch.load(f'checkpoints/{tag}/val_best.pth',
-                      map_location=device, weights_only=False)
-    saved = ckpt.get('args', {})
-    m = CPAGRN(feature_size=4, d_model=64, gru_layers=1,
-               pred_len=saved.get('pred_len', pred_len)).to(device)
-    m.load_state_dict(ckpt['model'])
-    m.eval()
-    return m, ckpt.get('stats')
+def pairwise_dcpa_tcpa(pos: np.ndarray, vel: np.ndarray, eps: float = 1e-6):
+    """
+    pos, vel: [N, 2]  (z-score space, ίδιο convention με το μοντέλο)
+    Returns: dcpa [N,N], tcpa [N,N]  (ίδιο clamping με CPAFeatures)
+    """
+    N = pos.shape[0]
+    pos_i = pos[:, None, :]
+    pos_j = pos[None, :, :]
+    vel_i = vel[:, None, :]
+    vel_j = vel[None, :, :]
 
+    r = pos_j - pos_i
+    v = vel_j - vel_i
+
+    v_sq = (v * v).sum(-1) + eps
+    tcpa = np.clip(-(r * v).sum(-1) / v_sq, -5.0, 5.0)
+    dcpa = np.clip(np.linalg.norm(r + tcpa[..., None] * v, axis=-1), 0.0, 10.0)
+    return dcpa, tcpa
+
+
+def find_convergence_scenes(test_ds, min_tcpa=0.5, max_tcpa=8.0,
+                             min_speed=0.05, top_n=5):
+    """
+    Σαρώνει όλο το test set (χωρίς μοντέλα) και επιστρέφει τα top_n σενάρια
+    με μικρότερο DCPA μεταξύ ενός ζεύγους πλοίων, υπό τους περιορισμούς
+    πραγματικής μελλοντικής σύγκλισης.
+
+    Returns: list of dict {scene_idx, i, j, dcpa, tcpa}
+    """
+    candidates = []
+    for idx in range(len(test_ds)):
+        obs = test_ds.obs_list[idx]           # [N, T_obs, 4] numpy, z-score
+        N = obs.shape[0]
+        if N < 2:
+            continue
+
+        pos_last = obs[:, -1, :2]
+        pos_prev = obs[:, -2, :2]
+        vel_last = pos_last - pos_prev
+
+        speed = np.linalg.norm(vel_last, axis=-1)          # [N]
+        dcpa, tcpa = pairwise_dcpa_tcpa(pos_last, vel_last)  # [N,N] each
+
+        np.fill_diagonal(dcpa, np.inf)
+
+        speed_ok = (speed[:, None] > min_speed) & (speed[None, :] > min_speed)
+        tcpa_ok  = (tcpa > min_tcpa) & (tcpa < max_tcpa)
+        valid    = speed_ok & tcpa_ok
+
+        dcpa_masked = np.where(valid, dcpa, np.inf)
+        if not np.isfinite(dcpa_masked).any():
+            continue
+
+        i, j = np.unravel_index(np.argmin(dcpa_masked), dcpa_masked.shape)
+        candidates.append({
+            'scene_idx': idx, 'i': int(i), 'j': int(j),
+            'dcpa': float(dcpa_masked[i, j]), 'tcpa': float(tcpa[i, j]),
+        })
+
+    candidates.sort(key=lambda c: c['dcpa'])
+    return candidates[:top_n]
+
+
+# ── Model loaders (ίδιο pattern με measure_inference.py) ────────────────────
 
 def load_lstm(tag, pred_len, device):
     from model_lstm import VanillaLSTM
     ckpt = torch.load(f'checkpoints/{tag}/val_best.pth',
                       map_location=device, weights_only=False)
     saved = ckpt.get('args', {})
-    m = VanillaLSTM(feature_size=4, hidden_size=64, num_layers=1,
+    m = VanillaLSTM(feature_size=4,
+                    hidden_size=saved.get('hidden_size', 64),
+                    num_layers=saved.get('num_layers', 1),
                     pred_len=saved.get('pred_len', pred_len)).to(device)
     m.load_state_dict(ckpt['model'])
     m.eval()
-    return m, ckpt.get('stats')
+    return m
 
 
-def load_nocpa(tag, pred_len, device):
-    from model_cpagrn_nocpa import CPAGRN as NoCPA
+def load_cpagrn(tag, pred_len, device):
+    from model_cpagrn import CPAGRN
     ckpt = torch.load(f'checkpoints/{tag}/val_best.pth',
                       map_location=device, weights_only=False)
-    m = NoCPA(feature_size=4, d_model=64, gru_layers=1,
-              pred_len=pred_len).to(device)
+    saved = ckpt.get('args', {})
+    m = CPAGRN(feature_size=4,
+               d_model=saved.get('d_model', 64),
+               gru_layers=saved.get('gru_layers', 1),
+               pred_len=saved.get('pred_len', pred_len)).to(device)
     m.load_state_dict(ckpt['model'])
     m.eval()
-    return m, ckpt.get('stats')
+    return m
 
 
-# ── Inference helpers ─────────────────────────────────────────────────────────
+def make_identity(T: int, N: int, device):
+    identity_spatial  = torch.ones((T, N, N), device=device) * torch.eye(N, device=device)
+    identity_temporal = torch.ones((N, T, T), device=device) * torch.eye(T, device=device)
+    return [identity_spatial, identity_temporal]
 
-def predict(model, obs, mask, use_mask=True):
-    """Returns pred_disp [B, N, T, 2] on CPU."""
+
+def load_smchn(tag, obs_len, pred_len, device):
+    from model_smchn import TrajectoryModel
+    ckpt = torch.load(f'checkpoints/{tag}/val_best.pth',
+                      map_location=device, weights_only=False)
+    saved = ckpt.get('args', {})
+    m = TrajectoryModel(
+        number_asymmetric_conv_layer = saved.get('number_asymmetric_conv_layer', 2),
+        embedding_dims               = saved.get('embedding_dims', 64),
+        number_gcn_layers            = saved.get('number_gcn_layers', 1),
+        dropout                      = 0.0,
+        obs_len                      = saved.get('obs_len', obs_len),
+        pred_len                     = saved.get('pred_len', pred_len),
+        out_dims                     = 5,
+        num_heads                    = saved.get('num_heads', 4),
+    ).to(device)
+    m.load_state_dict(ckpt['model'])
+    m.eval()
+    return m
+
+
+def smchn_predict_abs(model, obs_t, device):
+    """
+    obs_t: [1, N, T_obs, 4] tensor (όλη η σκηνή, ήδη στο device)
+    Returns: pred_abs [T_pred, N, 2]  (z-score absolute LON/LAT), ίδιο
+    convention με evaluate_smchn.py.
+    """
+    N = obs_t.shape[1]
+    T_obs = obs_t.shape[2]
+
+    abs_obs = obs_t[0].permute(1, 0, 2)          # [T_obs, N, 4]
+    rel_obs = torch.zeros_like(abs_obs)
+    rel_obs[1:] = abs_obs[1:] - abs_obs[:-1]
+
+    pos_idx = torch.arange(1, T_obs + 1, device=device, dtype=torch.float32)
+    pos_idx = pos_idx.view(T_obs, 1, 1).expand(T_obs, N, 1)
+
+    V_obs = torch.cat([pos_idx, rel_obs], dim=-1).unsqueeze(0)  # [1,T_obs,N,5]
+    identity = make_identity(T_obs, N, device)
+
+    V_pred = model(V_obs, identity)              # [T_pred, N, 5] Gaussian params over VELOCITY
+    mu_vel = V_pred[:, :, :2]
+    last_obs_pos = abs_obs[-1, :, :2]
+    mu_abs = torch.cumsum(mu_vel, dim=0) + last_obs_pos.unsqueeze(0)  # [T_pred,N,2]
+    return mu_abs
+
+
+# ── Πρόβλεψη + denormalization για ένα σενάριο ──────────────────────────────
+
+def predict_scene(test_ds, scene_idx, lstm, cpagrn, smchn, device, stats):
+    obs_np  = test_ds.obs_list[scene_idx]    # [N, T_obs, 4]
+    pred_np = test_ds.pred_list[scene_idx]   # [N, T_pred, 2]
+    N = obs_np.shape[0]
+
+    obs_t  = torch.from_numpy(obs_np).unsqueeze(0).float().to(device)   # [1,N,T_obs,4]
+    mask_t = torch.ones(1, N, dtype=torch.bool, device=device)
+
+    last_obs = obs_t[:, :, -1, :2]           # [1,N,2]
+
     with torch.no_grad():
-        if use_mask:
-            return model(obs, mask=mask).cpu()
-        else:
-            return model(obs).cpu()
+        disp_lstm   = lstm(obs_t, mask=mask_t)                       # [1,N,T_pred,2]
+        disp_cpagrn = cpagrn(obs_t, mask=mask_t)                     # [1,N,T_pred,2]
+        abs_lstm    = (disp_lstm   + last_obs.unsqueeze(2))[0].cpu().numpy()   # [N,T_pred,2]
+        abs_cpagrn  = (disp_cpagrn + last_obs.unsqueeze(2))[0].cpu().numpy()
 
+        abs_smchn = None
+        if smchn is not None:
+            mu_abs = smchn_predict_abs(smchn, obs_t, device)         # [T_pred,N,2]
+            abs_smchn = mu_abs.permute(1, 0, 2).cpu().numpy()        # [N,T_pred,2]
 
-def disp_to_abs_deg(pred_disp, obs_cpu, stats):
-    """Convert z-score displacement → absolute degrees."""
     lon_mean, lon_std = stats['LON']['mean'], stats['LON']['std']
     lat_mean, lat_std = stats['LAT']['mean'], stats['LAT']['std']
 
-    last_obs = obs_cpu[:, :, -1, :2]          # [B, N, 2] z-score
-    pred_abs_z = pred_disp + last_obs.unsqueeze(2)  # [B, N, T, 2]
+    def to_degrees(arr_zscore):
+        lon = denorm(arr_zscore[..., 0], lon_mean, lon_std)
+        lat = denorm(arr_zscore[..., 1], lat_mean, lat_std)
+        return lon, lat
 
-    pred_lon = denorm(pred_abs_z[..., 0].numpy(), lon_mean, lon_std)
-    pred_lat = denorm(pred_abs_z[..., 1].numpy(), lat_mean, lat_std)
-    return pred_lon, pred_lat   # both [B, N, T]
+    result = {
+        'obs_lonlat':    to_degrees(obs_np[..., :2]),     # ([N,T_obs], [N,T_obs])
+        'gt_lonlat':     to_degrees(pred_np),              # ([N,T_pred], [N,T_pred])
+        'lstm_lonlat':   to_degrees(abs_lstm),
+        'cpagrn_lonlat': to_degrees(abs_cpagrn),
+    }
+    if abs_smchn is not None:
+        result['smchn_lonlat'] = to_degrees(abs_smchn)
+    return result
 
 
-def obs_to_deg(obs_cpu, stats):
-    """Convert z-score obs → degrees."""
-    lon_mean, lon_std = stats['LON']['mean'], stats['LON']['std']
-    lat_mean, lat_std = stats['LAT']['mean'], stats['LAT']['std']
-    obs_lon = denorm(obs_cpu[..., 0].numpy(), lon_mean, lon_std)
-    obs_lat = denorm(obs_cpu[..., 1].numpy(), lat_mean, lat_std)
-    return obs_lon, obs_lat    # [B, N, T_obs]
+def ade_degrees(pred_lon, pred_lat, true_lon, true_lat, vessel_idx):
+    err = np.sqrt((pred_lon[vessel_idx] - true_lon[vessel_idx])**2 +
+                  (pred_lat[vessel_idx] - true_lat[vessel_idx])**2)
+    return float(err.mean())
 
 
-def ade(pred_lon, pred_lat, true_lon, true_lat, mask_np):
-    """Per-vessel ADE [B, N]."""
-    err = np.sqrt((pred_lon - true_lon)**2 + (pred_lat - true_lat)**2)
-    return err.mean(axis=-1)  # [B, N]
+# ── Plot ─────────────────────────────────────────────────────────────────────
+
+def plot_scene(result, i, j, dcpa, tcpa, out_path, include_smchn):
+    obs_lon, obs_lat   = result['obs_lonlat']
+    gt_lon,  gt_lat    = result['gt_lonlat']
+    lstm_lon, lstm_lat = result['lstm_lonlat']
+    cpa_lon,  cpa_lat  = result['cpagrn_lonlat']
+
+    fig, ax = plt.subplots(figsize=(8, 7))
+
+    # Context: όλα τα άλλα πλοία της σκηνής, μόνο η τελευταία παρατηρούμενη
+    # θέση τους, ως αχνά γκρι σημεία (δείχνει την πυκνότητα του σκηνικού
+    # χωρίς να γεμίζει το plot με τροχιές που δεν μας ενδιαφέρουν).
+    N = obs_lon.shape[0]
+    other = [k for k in range(N) if k not in (i, j)]
+    ax.scatter(obs_lon[other, -1], obs_lat[other, -1],
+               c='lightgray', s=12, zorder=1, label='Άλλα πλοία σκηνής (τελ. θέση)')
+
+    colors = {'i': 'tab:blue', 'j': 'tab:orange'}
+    for vessel, color, label in [(i, colors['i'], 'Πλοίο A'), (j, colors['j'], 'Πλοίο B')]:
+        # Παρατήρηση (obs)
+        ax.plot(obs_lon[vessel], obs_lat[vessel], '-o', color=color,
+                linewidth=2, markersize=4, zorder=3,
+                label=f'{label} — παρατήρηση')
+        # Πραγματική συνέχεια (ground truth)
+        full_gt_lon = np.concatenate([[obs_lon[vessel, -1]], gt_lon[vessel]])
+        full_gt_lat = np.concatenate([[obs_lat[vessel, -1]], gt_lat[vessel]])
+        ax.plot(full_gt_lon, full_gt_lat, '-', color=color, linewidth=2,
+                alpha=0.9, zorder=3, label=f'{label} — πραγματική τροχιά')
+        # LSTM πρόβλεψη
+        full_lstm_lon = np.concatenate([[obs_lon[vessel, -1]], lstm_lon[vessel]])
+        full_lstm_lat = np.concatenate([[obs_lat[vessel, -1]], lstm_lat[vessel]])
+        ax.plot(full_lstm_lon, full_lstm_lat, '--', color=color, linewidth=1.6,
+                alpha=0.7, zorder=2, label=f'{label} — LSTM πρόβλεψη')
+        # CPA-GRN πρόβλεψη
+        full_cpa_lon = np.concatenate([[obs_lon[vessel, -1]], cpa_lon[vessel]])
+        full_cpa_lat = np.concatenate([[obs_lat[vessel, -1]], cpa_lat[vessel]])
+        ax.plot(full_cpa_lon, full_cpa_lat, ':', color=color, linewidth=2.2,
+                alpha=0.9, zorder=4, label=f'{label} — CPA-GRN πρόβλεψη')
+
+        if include_smchn and 'smchn_lonlat' in result:
+            sm_lon, sm_lat = result['smchn_lonlat']
+            full_sm_lon = np.concatenate([[obs_lon[vessel, -1]], sm_lon[vessel]])
+            full_sm_lat = np.concatenate([[obs_lat[vessel, -1]], sm_lat[vessel]])
+            ax.plot(full_sm_lon, full_sm_lat, '-.', color=color, linewidth=1.4,
+                    alpha=0.6, zorder=2, label=f'{label} — SMCHN πρόβλεψη')
+
+        # Marker στο τελευταίο σημείο παρατήρησης (σημείο σύγκλισης)
+        ax.scatter([obs_lon[vessel, -1]], [obs_lat[vessel, -1]],
+                   c=color, s=90, marker='*', zorder=5, edgecolors='black')
+
+    ade_lstm_i = ade_degrees(lstm_lon, lstm_lat, gt_lon, gt_lat, i)
+    ade_cpa_i  = ade_degrees(cpa_lon,  cpa_lat,  gt_lon, gt_lat, i)
+    ade_lstm_j = ade_degrees(lstm_lon, lstm_lat, gt_lon, gt_lat, j)
+    ade_cpa_j  = ade_degrees(cpa_lon,  cpa_lat,  gt_lon, gt_lat, j)
+
+    title = (f'Σενάριο σύγκλισης — DCPA={dcpa:.4f}° TCPA={tcpa:.1f} min '
+             f'(z-score timesteps)\n'
+             f'ADE Πλοίο A: LSTM={ade_lstm_i:.5f}° CPA-GRN={ade_cpa_i:.5f}°   |   '
+             f'ADE Πλοίο B: LSTM={ade_lstm_j:.5f}° CPA-GRN={ade_cpa_j:.5f}°')
+    ax.set_title(title, fontsize=10)
+    ax.set_xlabel('Γεωγραφικό μήκος (LON, °)')
+    ax.set_ylabel('Γεωγραφικό πλάτος (LAT, °)')
+    ax.legend(fontsize=7, loc='best', ncol=2)
+    ax.set_aspect('equal', adjustable='datalim')
+    fig.tight_layout()
+
+    fig.savefig(out_path + '.png', dpi=300)
+    fig.savefig(out_path + '.pdf')
+    plt.close(fig)
+
+    return {
+        'ade_lstm_i': ade_lstm_i, 'ade_cpa_i': ade_cpa_i,
+        'ade_lstm_j': ade_lstm_j, 'ade_cpa_j': ade_cpa_j,
+    }
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument('--gpu_num',  type=int, default=0)
-    p.add_argument('--obs_len',  type=int, default=10)
-    p.add_argument('--pred_len', type=int, default=10)
-    p.add_argument('--out',      type=str, default='trajectories.pdf')
-    p.add_argument('--n_vessels', type=int, default=4,
-                   help='How many vessels to plot per scene')
+    p.add_argument('--gpu_num',   type=int, default=0)
+    p.add_argument('--obs_len',   type=int, default=10)
+    p.add_argument('--pred_len',  type=int, default=10)
+    p.add_argument('--seed',      type=int, default=42)
+    p.add_argument('--data_dir',  type=str, default='dataset/noaa_dec2021_1min')
+    p.add_argument('--out_dir',   type=str, default='figures/convergence')
+    p.add_argument('--top_n',     type=int, default=3,
+                   help='Πόσα υποψήφια σενάρια σύγκλισης να αποθηκευτούν (ταξινομημένα κατά DCPA)')
+    p.add_argument('--min_tcpa',  type=float, default=0.5)
+    p.add_argument('--max_tcpa',  type=float, default=8.0)
+    p.add_argument('--min_speed', type=float, default=0.05)
+    p.add_argument('--include_smchn', action='store_true')
     args = p.parse_args()
 
     os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu_num)
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    T = args.obs_len
+    print(f'Device: {device}')
 
-    print('Loading models...')
-    lstm,   stats = load_lstm  (f'LSTM_obs{T}_pred{T}_s42',   args.pred_len, device)
-    nocpa,  _     = load_nocpa (f'CPAGRN_nocpa_v4_obs{T}_pred{T}_s42', args.pred_len, device)
-    cpagrn, _     = load_cpagrn(f'CPAGRN_obs{T}_pred{T}_s42', args.pred_len, device)
+    os.makedirs(args.out_dir, exist_ok=True)
 
-    # stats from CPA-GRN checkpoint (same for all)
-    if stats is None:
-        import json
-        with open('dataset/noaa_dec2021_1min/global_stats.json') as f:
-            stats = json.load(f)
+    with open(os.path.join(args.data_dir, 'global_stats.json')) as f:
+        stats = json.load(f)
 
-    _, _, test_loader, _ = get_dataloaders(
-        'dataset/noaa_dec2021_1min', args.obs_len, args.pred_len, batch_size=8
+    print('Φόρτωση test dataset...')
+    test_ds = AISDataset(os.path.join(args.data_dir, 'test'),
+                          args.obs_len, args.pred_len,
+                          stride=args.obs_len + args.pred_len)
+    print(f'  Test set: {len(test_ds):,} σκηνές\n')
+
+    print('Αναζήτηση σεναρίων σύγκλισης (καθαρά γεωμετρικά, χωρίς μοντέλα)...')
+    candidates = find_convergence_scenes(
+        test_ds, min_tcpa=args.min_tcpa, max_tcpa=args.max_tcpa,
+        min_speed=args.min_speed, top_n=args.top_n,
     )
-
-    print('Searching for best scene...')
-    best_scene = None
-    best_advantage = -np.inf
-
-    for obs, pred_gt, mask, _ in test_loader:
-        obs_d    = obs.to(device)
-        mask_d   = mask.to(device)
-        obs_cpu  = obs.cpu()
-        mask_np  = mask.numpy()
-
-        # Ground truth in degrees
-        last_obs_z = obs_cpu[:, :, -1, :2]
-        gt_disp    = pred_gt.cpu() - last_obs_z.unsqueeze(2)
-        gt_lon, gt_lat = disp_to_abs_deg(gt_disp, obs_cpu, stats)
-
-        # Predictions
-        pred_lstm   = predict(lstm,   obs_d, mask_d, use_mask=False)
-        pred_nocpa  = predict(nocpa,  obs_d, mask_d, use_mask=True)
-        pred_cpagrn = predict(cpagrn, obs_d, mask_d, use_mask=True)
-
-        lstm_lon,   lstm_lat   = disp_to_abs_deg(pred_lstm,   obs_cpu, stats)
-        nocpa_lon,  nocpa_lat  = disp_to_abs_deg(pred_nocpa,  obs_cpu, stats)
-        cpagrn_lon, cpagrn_lat = disp_to_abs_deg(pred_cpagrn, obs_cpu, stats)
-
-        ade_lstm   = ade(lstm_lon,   lstm_lat,   gt_lon, gt_lat, mask_np)
-        ade_cpagrn = ade(cpagrn_lon, cpagrn_lat, gt_lon, gt_lat, mask_np)
-
-        # Scene score: mean advantage of CPA-GRN over LSTM (masked)
-        valid = mask_np.astype(bool)
-        diff  = (ade_lstm - ade_cpagrn)  # positive = CPA-GRN better
-        score = diff[valid].mean() if valid.any() else -np.inf
-
-        if score > best_advantage:
-            best_advantage = score
-            best_scene = {
-                'obs_cpu':    obs_cpu,
-                'mask_np':    mask_np,
-                'gt_lon':     gt_lon,
-                'gt_lat':     gt_lat,
-                'lstm_lon':   lstm_lon,   'lstm_lat':   lstm_lat,
-                'nocpa_lon':  nocpa_lon,  'nocpa_lat':  nocpa_lat,
-                'cpagrn_lon': cpagrn_lon, 'cpagrn_lat': cpagrn_lat,
-                'ade_lstm':   ade_lstm,
-                'ade_cpagrn': ade_cpagrn,
-            }
-
-    print(f'Best scene: CPA-GRN advantage = {best_advantage*60:.4f} nm avg')
-
-    # ── Select top vessels (most active: highest ADE spread) ─────────────────
-    sc = best_scene
-    valid_b, valid_n = np.where(sc['mask_np'])
-
-    # Sort by LSTM ADE descending → pick vessels where models disagree most
-    scores = sc['ade_lstm'][valid_b, valid_n]
-    top_idx = np.argsort(scores)[::-1][:args.n_vessels]
-    sel = [(valid_b[i], valid_n[i]) for i in top_idx]
-
-    # Obs in degrees
-    obs_cpu = sc['obs_cpu']
-    obs_lon_all = denorm(obs_cpu[..., 0].numpy(),
-                         stats['LON']['mean'], stats['LON']['std'])
-    obs_lat_all = denorm(obs_cpu[..., 1].numpy(),
-                         stats['LAT']['mean'], stats['LAT']['std'])
-
-    # ── Plot ─────────────────────────────────────────────────────────────────
-    fig, axes = plt.subplots(1, len(sel), figsize=(4.5 * len(sel), 4.5),
-                             constrained_layout=True)
-    if len(sel) == 1:
-        axes = [axes]
-
-    colors = {
-        'Ground truth': 'black',
-        'LSTM':         '#1f77b4',
-        'No-CPA v4':    '#ff7f0e',
-        'CPA-GRN v4':   '#2ca02c',
-    }
-
-    for ax, (b, n) in zip(axes, sel):
-        obs_lon = obs_lon_all[b, n, :]    # [T_obs]
-        obs_lat = obs_lat_all[b, n, :]
-
-        # Observed trajectory
-        ax.plot(obs_lon, obs_lat, 'o-', color='grey', lw=1.5,
-                ms=4, label='Observed', zorder=3)
-        ax.plot(obs_lon[-1], obs_lat[-1], 's', color='grey',
-                ms=8, zorder=4)   # last observed position
-
-        # Ground truth future
-        ax.plot(sc['gt_lon'][b, n, :], sc['gt_lat'][b, n, :],
-                'o-', color=colors['Ground truth'], lw=2,
-                ms=4, label='Ground truth', zorder=5)
-
-        # Model predictions
-        for name, plon, plat in [
-            ('LSTM',       sc['lstm_lon'],   sc['lstm_lat']),
-            ('No-CPA v4',  sc['nocpa_lon'],  sc['nocpa_lat']),
-            ('CPA-GRN v4', sc['cpagrn_lon'], sc['cpagrn_lat']),
-        ]:
-            ax.plot(plon[b, n, :], plat[b, n, :],
-                    '--', color=colors[name], lw=1.8,
-                    ms=3, label=name, zorder=4)
-
-        ade_l = sc['ade_lstm'][b, n] * 60
-        ade_c = sc['ade_cpagrn'][b, n] * 60
-        ax.set_title(
-            f'Vessel {n+1}\n'
-            f'ADE: LSTM={ade_l:.3f} nm  |  CPA-GRN={ade_c:.3f} nm',
-            fontsize=9
+    if not candidates:
+        raise RuntimeError(
+            'Δεν βρέθηκε κανένα σενάριο σύγκλισης με τους δεδομένους '
+            'περιορισμούς (--min_tcpa/--max_tcpa/--min_speed). Δοκίμασε να '
+            'χαλαρώσεις τα thresholds.'
         )
-        ax.set_xlabel('Longitude (°)', fontsize=9)
-        ax.set_ylabel('Latitude (°)',  fontsize=9)
-        ax.tick_params(labelsize=8)
-        ax.grid(True, alpha=0.3)
+    print(f'  Βρέθηκαν {len(candidates)} υποψήφια σενάρια (ταξινομημένα κατά DCPA):')
+    for c in candidates:
+        print(f"    scene={c['scene_idx']:>4}  i={c['i']:>3} j={c['j']:>3}  "
+              f"DCPA={c['dcpa']:.4f}°  TCPA={c['tcpa']:.2f}")
 
-    # Shared legend
-    handles = [
-        plt.Line2D([0],[0], color='grey',                    lw=1.5, marker='o', ms=4, label='Observed'),
-        plt.Line2D([0],[0], color=colors['Ground truth'],    lw=2,   marker='o', ms=4, label='Ground truth'),
-        plt.Line2D([0],[0], color=colors['LSTM'],            lw=1.8, ls='--',    label='LSTM'),
-        plt.Line2D([0],[0], color=colors['No-CPA v4'],       lw=1.8, ls='--',    label='No-CPA v4'),
-        plt.Line2D([0],[0], color=colors['CPA-GRN v4'],      lw=1.8, ls='--',    label='CPA-GRN v4'),
-    ]
-    fig.legend(handles=handles, loc='lower center', ncol=5,
-               fontsize=8, bbox_to_anchor=(0.5, -0.08))
+    lstm_tag   = f'LSTM_obs{args.obs_len}_pred{args.pred_len}'
+    cpagrn_tag = f'CPAGRN_obs{args.obs_len}_pred{args.pred_len}_s{args.seed}'
+    smchn_tag  = f'SMCHN_obs{args.obs_len}_pred{args.pred_len}_s{args.seed}'
 
-    fig.suptitle(f'Vessel Trajectory Prediction — {T}-min Horizon\n'
-                 f'(San Diego AIS, December 2021, Test Set)',
-                 fontsize=11, fontweight='bold')
+    print('\nΦόρτωση μοντέλων...')
+    lstm   = load_lstm(lstm_tag, args.pred_len, device)
+    cpagrn = load_cpagrn(cpagrn_tag, args.pred_len, device)
+    smchn  = None
+    if args.include_smchn:
+        try:
+            smchn = load_smchn(smchn_tag, args.obs_len, args.pred_len, device)
+        except Exception as e:
+            print(f'  ⚠ SMCHN δεν φορτώθηκε ({e}) — συνεχίζω χωρίς αυτό.')
 
-    plt.savefig(args.out, dpi=300, bbox_inches='tight')
-    print(f'Saved → {args.out}')
+    print('\nΠαραγωγή plots...')
+    for rank, c in enumerate(candidates, 1):
+        result = predict_scene(test_ds, c['scene_idx'], lstm, cpagrn, smchn, device, stats)
+        out_path = os.path.join(args.out_dir, f'convergence_{rank}_scene{c["scene_idx"]}')
+        ades = plot_scene(result, c['i'], c['j'], c['dcpa'], c['tcpa'],
+                           out_path, include_smchn=args.include_smchn)
+        print(f"  [{rank}] scene={c['scene_idx']} → {out_path}.png")
+        print(f"       ADE A: LSTM={ades['ade_lstm_i']:.5f}° CPA-GRN={ades['ade_cpa_i']:.5f}°  "
+              f"({'CPA-GRN καλύτερο' if ades['ade_cpa_i']<ades['ade_lstm_i'] else 'LSTM καλύτερο'})")
+        print(f"       ADE B: LSTM={ades['ade_lstm_j']:.5f}° CPA-GRN={ades['ade_cpa_j']:.5f}°  "
+              f"({'CPA-GRN καλύτερο' if ades['ade_cpa_j']<ades['ade_lstm_j'] else 'LSTM καλύτερο'})")
+
+    print(f'\nΈτοιμο. Έλεγξε τα {args.top_n} candidate plots στο {args.out_dir}/ '
+          f'και διάλεξε το πιο καθαρό οπτικά για την εργασία.')
 
 
 if __name__ == '__main__':
