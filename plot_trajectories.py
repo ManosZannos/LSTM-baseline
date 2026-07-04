@@ -323,6 +323,24 @@ def plot_scene(result, i, j, dcpa, tcpa, out_path, include_smchn):
     ax.scatter(obs_lon[other, -1], obs_lat[other, -1],
                c='lightgray', s=12, zorder=1, label='Άλλα πλοία σκηνής (τελ. θέση)')
 
+    # ── Υπολογισμός bounding box ΓΥΡΩ ΑΠΟ ΤΑ ΔΥΟ ΠΛΟΙΑ ──────────────────────
+    # Χωρίς αυτό, το plot δείχνει ολόκληρη τη σκηνή (~2-3°) ενώ οι
+    # μετατοπίσεις που μας ενδιαφέρουν είναι ~0,001-0,01° — αόρατες χωρίς zoom.
+    all_lons, all_lats = [], []
+    for vessel in (i, j):
+        all_lons += [obs_lon[vessel], gt_lon[vessel], lstm_lon[vessel], cpa_lon[vessel]]
+        all_lats += [obs_lat[vessel], gt_lat[vessel], lstm_lat[vessel], cpa_lat[vessel]]
+        if include_smchn and 'smchn_lonlat' in result:
+            sm_lon, sm_lat = result['smchn_lonlat']
+            all_lons.append(sm_lon[vessel]); all_lats.append(sm_lat[vessel])
+    all_lons = np.concatenate(all_lons)
+    all_lats = np.concatenate(all_lats)
+
+    lon_min, lon_max = all_lons.min(), all_lons.max()
+    lat_min, lat_max = all_lats.min(), all_lats.max()
+    lon_pad = max((lon_max - lon_min) * 0.35, 0.003)
+    lat_pad = max((lat_max - lat_min) * 0.35, 0.003)
+
     colors = {'i': 'tab:blue', 'j': 'tab:orange'}
     for vessel, color, label in [(i, colors['i'], 'Πλοίο A'), (j, colors['j'], 'Πλοίο B')]:
         # Παρατήρηση (obs)
@@ -355,6 +373,9 @@ def plot_scene(result, i, j, dcpa, tcpa, out_path, include_smchn):
         # Marker στο τελευταίο σημείο παρατήρησης (σημείο σύγκλισης)
         ax.scatter([obs_lon[vessel, -1]], [obs_lat[vessel, -1]],
                    c=color, s=90, marker='*', zorder=5, edgecolors='black')
+
+    ax.set_xlim(lon_min - lon_pad, lon_max + lon_pad)
+    ax.set_ylim(lat_min - lat_pad, lat_max + lat_pad)
 
     ade_lstm_i = ade_degrees(lstm_lon, lstm_lat, gt_lon, gt_lat, i)
     ade_cpa_i  = ade_degrees(cpa_lon,  cpa_lat,  gt_lon, gt_lat, i)
