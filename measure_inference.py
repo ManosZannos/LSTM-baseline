@@ -103,58 +103,36 @@ def main():
     results = {}
 
     # 1. LSTM
-    print('Timing Vanilla LSTM...')
-    lstm = load_lstm(f'LSTM_obs{T}_pred{T}_s42', args.pred_len, device)
+    print('Timing LSTM...')
+    lstm = load_lstm('LSTM_obs10_pred10', args.pred_len, device)
     ms, sd = measure(lstm, batches, device, use_mask=False,
                      n_warmup=args.n_warmup, n_measure=args.n_measure)
     results['LSTM'] = (ms, sd)
     del lstm
 
-    # 2. No-CPA v4
-    print('\nTiming No-CPA v4...')
-    try:
-        # swap file expected at checkpoints/CPAGRN_nocpa_v4_obs10_pred10_s42/
-        tag_nocpa = f'CPAGRN_nocpa_v4_obs{T}_pred{T}_s42'
-        ckpt = torch.load(f'checkpoints/{tag_nocpa}/val_best.pth',
-                          map_location=device, weights_only=False)
-        from model_cpagrn_nocpa import CPAGRN as NoCPA
-        saved = ckpt.get('args', {})
-        nocpa = NoCPA(feature_size=4, d_model=64, gru_layers=1,
-                      pred_len=args.pred_len).to(device)
-        nocpa.load_state_dict(ckpt['model'])
-        nocpa.eval()
-        print(f'  Loaded {tag_nocpa}  (epoch {ckpt["epoch"]})')
-        ms, sd = measure(nocpa, batches, device, use_mask=True,
-                         n_warmup=args.n_warmup, n_measure=args.n_measure)
-        results['No-CPA v4'] = (ms, sd)
-        del nocpa
-    except Exception as e:
-        print(f'  Skipped: {e}')
+    # 2. No-CPA v4 — checkpoint on DGX, skip on RTX
+    print('\nNo-CPA v4: checkpoint on DGX — skipped')
 
     # 3. CPA-GRN v4
     print('\nTiming CPA-GRN v4...')
-    cpagrn = load_cpagrn(f'CPAGRN_obs{T}_pred{T}_s42', args.pred_len, device)
+    cpagrn = load_cpagrn('CPAGRN_obs10_pred10_s42', args.pred_len, device)
     ms, sd = measure(cpagrn, batches, device, use_mask=True,
                      n_warmup=args.n_warmup, n_measure=args.n_measure)
     results['CPA-GRN v4'] = (ms, sd)
     del cpagrn
 
-    # 4. SMCHN  (skip if model unavailable)
+    # 4. SMCHN
     print('\nTiming SMCHN...')
     try:
         from model_smchn import SMCHN
-        tag_smchn = f'SMCHN_obs{T}_pred{T}_s42'
-        ckpt = torch.load(f'checkpoints/{tag_smchn}/val_best.pth',
+        ckpt = torch.load('checkpoints/SMCHN_obs10_pred10_s42/val_best.pth',
                           map_location=device, weights_only=False)
         saved = ckpt.get('args', {})
-        smchn = SMCHN(obs_len=args.obs_len, pred_len=args.pred_len).to(device)
+        smchn = SMCHN(**{k: v for k, v in saved.items()
+                         if k in ['obs_len', 'pred_len']}).to(device)
         smchn.load_state_dict(ckpt['model'])
         smchn.eval()
-        print(f'  Loaded {tag_smchn}  (epoch {ckpt["epoch"]})')
-
-        def smchn_forward(obs, mask):
-            out = smchn(obs, mask=mask)
-            return out  # SMCHN returns (mu, sigma) or similar
+        print(f'  Loaded SMCHN_obs10_pred10_s42  (epoch {ckpt["epoch"]})')
         ms, sd = measure(smchn, batches, device, use_mask=True,
                          n_warmup=args.n_warmup, n_measure=args.n_measure)
         results['SMCHN'] = (ms, sd)
