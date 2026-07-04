@@ -65,11 +65,14 @@ def pairwise_dcpa_tcpa(pos: np.ndarray, vel: np.ndarray, eps: float = 1e-6):
 
 
 def find_convergence_scenes(test_ds, min_tcpa=0.5, max_tcpa=8.0,
-                             min_speed=0.05, top_n=5):
+                             min_speed=0.05, scan_n=30):
     """
-    Σαρώνει όλο το test set (χωρίς μοντέλα) και επιστρέφει τα top_n σενάρια
+    Σαρώνει όλο το test set (χωρίς μοντέλα) και επιστρέφει τα scan_n σενάρια
     με μικρότερο DCPA μεταξύ ενός ζεύγους πλοίων, υπό τους περιορισμούς
-    πραγματικής μελλοντικής σύγκλισης.
+    πραγματικής μελλοντικής σύγκλισης. scan_n είναι το μέγεθος της ΔΕΞΑΜΕΝΗΣ
+    υποψηφίων (candidate pool) — η τελική επιλογή για plotting γίνεται
+    ΞΕΧΩΡΙΣΤΑ, με δεύτερο κριτήριο (βλ. rank_by_cpa_advantage), ώστε να μην
+    διαλέγουμε τυφλά με μόνο κριτήριο DCPA.
 
     Returns: list of dict {scene_idx, i, j, dcpa, tcpa}
     """
@@ -104,7 +107,24 @@ def find_convergence_scenes(test_ds, min_tcpa=0.5, max_tcpa=8.0,
         })
 
     candidates.sort(key=lambda c: c['dcpa'])
-    return candidates[:top_n]
+    return candidates[:scan_n]
+
+
+def scene_aggregate_ade(result, N):
+    """
+    Μέσο ADE (σε μοίρες) πάνω σε ΟΛΑ τα πλοία της σκηνής — όχι μόνο το
+    επιλεγμένο ζεύγος — για LSTM και CPA-GRN. Χρήσιμο diagnostic: αν και τα
+    δύο μοντέλα έχουν μεγάλο σφάλμα σε όλη τη σκηνή, το σενάριο είναι απλώς
+    "δύσκολο" γενικά (π.χ. πλοίο με ασυνήθιστη ταχύτητα) και όχι ειδικά
+    διαφωτιστικό για τη συνεισφορά του CPA.
+    """
+    gt_lon, gt_lat     = result['gt_lonlat']
+    lstm_lon, lstm_lat = result['lstm_lonlat']
+    cpa_lon, cpa_lat   = result['cpagrn_lonlat']
+
+    err_lstm = np.sqrt((lstm_lon - gt_lon)**2 + (lstm_lat - gt_lat)**2)  # [N,T_pred]
+    err_cpa  = np.sqrt((cpa_lon  - gt_lon)**2 + (cpa_lat  - gt_lat)**2)
+    return float(err_lstm.mean()), float(err_cpa.mean())
 
 
 # ── Model loaders (ίδιο pattern με measure_inference.py) ────────────────────
@@ -324,8 +344,10 @@ def main():
     p.add_argument('--seed',      type=int, default=42)
     p.add_argument('--data_dir',  type=str, default='dataset/noaa_dec2021_1min')
     p.add_argument('--out_dir',   type=str, default='figures/convergence')
+    p.add_argument('--scan_n',    type=int, default=30,
+                   help='Πόσα υποψήφια σενάρια σύγκλισης (κατά DCPA) να αξιολογηθούν συνολικά')
     p.add_argument('--top_n',     type=int, default=3,
-                   help='Πόσα υποψήφια σενάρια σύγκλισης να αποθηκευτούν (ταξινομημένα κατά DCPA)')
+                   help='Πόσα από τα καλύτερα (κατά πλεονέκτημα CPA-GRN) να αποθηκευτούν ως plots')
     p.add_argument('--min_tcpa',  type=float, default=0.5)
     p.add_argument('--max_tcpa',  type=float, default=8.0)
     p.add_argument('--min_speed', type=float, default=0.05)
@@ -347,10 +369,10 @@ def main():
                           stride=args.obs_len + args.pred_len)
     print(f'  Test set: {len(test_ds):,} σκηνές\n')
 
-    print('Αναζήτηση σεναρίων σύγκλισης (καθαρά γεωμετρικά, χωρίς μοντέλα)...')
+    print(f'Αναζήτηση {args.scan_n} υποψήφιων σεναρίων σύγκλισης (καθαρά γεωμετρικά)...')
     candidates = find_convergence_scenes(
         test_ds, min_tcpa=args.min_tcpa, max_tcpa=args.max_tcpa,
-        min_speed=args.min_speed, top_n=args.top_n,
+        min_speed=args.min_speed, scan_n=args.scan_n,
     )
     if not candidates:
         raise RuntimeError(
@@ -358,16 +380,13 @@ def main():
             'περιορισμούς (--min_tcpa/--max_tcpa/--min_speed). Δοκίμασε να '
             'χαλαρώσεις τα thresholds.'
         )
-    print(f'  Βρέθηκαν {len(candidates)} υποψήφια σενάρια (ταξινομημένα κατά DCPA):')
-    for c in candidates:
-        print(f"    scene={c['scene_idx']:>4}  i={c['i']:>3} j={c['j']:>3}  "
-              f"DCPA={c['dcpa']:.4f}°  TCPA={c['tcpa']:.2f}")
+    print(f'  Βρέθηκαν {len(candidates)} υποψήφια σενάρια.\n')
 
     lstm_tag   = f'LSTM_obs{args.obs_len}_pred{args.pred_len}'
     cpagrn_tag = f'CPAGRN_obs{args.obs_len}_pred{args.pred_len}_s{args.seed}'
     smchn_tag  = f'SMCHN_obs{args.obs_len}_pred{args.pred_len}_s{args.seed}'
 
-    print('\nΦόρτωση μοντέλων...')
+    print('Φόρτωση μοντέλων...')
     lstm   = load_lstm(lstm_tag, args.pred_len, device)
     cpagrn = load_cpagrn(cpagrn_tag, args.pred_len, device)
     smchn  = None
@@ -377,20 +396,63 @@ def main():
         except Exception as e:
             print(f'  ⚠ SMCHN δεν φορτώθηκε ({e}) — συνεχίζω χωρίς αυτό.')
 
-    print('\nΠαραγωγή plots...')
-    for rank, c in enumerate(candidates, 1):
+    print('\nΑξιολόγηση όλων των υποψηφίων (αυτό μπορεί να πάρει λίγα λεπτά)...\n')
+    evaluated = []
+    for c in candidates:
         result = predict_scene(test_ds, c['scene_idx'], lstm, cpagrn, smchn, device, stats)
-        out_path = os.path.join(args.out_dir, f'convergence_{rank}_scene{c["scene_idx"]}')
-        ades = plot_scene(result, c['i'], c['j'], c['dcpa'], c['tcpa'],
-                           out_path, include_smchn=args.include_smchn)
-        print(f"  [{rank}] scene={c['scene_idx']} → {out_path}.png")
-        print(f"       ADE A: LSTM={ades['ade_lstm_i']:.5f}° CPA-GRN={ades['ade_cpa_i']:.5f}°  "
-              f"({'CPA-GRN καλύτερο' if ades['ade_cpa_i']<ades['ade_lstm_i'] else 'LSTM καλύτερο'})")
-        print(f"       ADE B: LSTM={ades['ade_lstm_j']:.5f}° CPA-GRN={ades['ade_cpa_j']:.5f}°  "
-              f"({'CPA-GRN καλύτερο' if ades['ade_cpa_j']<ades['ade_lstm_j'] else 'LSTM καλύτερο'})")
+        N = test_ds.obs_list[c['scene_idx']].shape[0]
 
-    print(f'\nΈτοιμο. Έλεγξε τα {args.top_n} candidate plots στο {args.out_dir}/ '
-          f'και διάλεξε το πιο καθαρό οπτικά για την εργασία.')
+        gt_lon, gt_lat     = result['gt_lonlat']
+        lstm_lon, lstm_lat = result['lstm_lonlat']
+        cpa_lon, cpa_lat   = result['cpagrn_lonlat']
+
+        ade_lstm_i = ade_degrees(lstm_lon, lstm_lat, gt_lon, gt_lat, c['i'])
+        ade_cpa_i  = ade_degrees(cpa_lon,  cpa_lat,  gt_lon, gt_lat, c['i'])
+        ade_lstm_j = ade_degrees(lstm_lon, lstm_lat, gt_lon, gt_lat, c['j'])
+        ade_cpa_j  = ade_degrees(cpa_lon,  cpa_lat,  gt_lon, gt_lat, c['j'])
+
+        pair_ade_lstm = (ade_lstm_i + ade_lstm_j) / 2
+        pair_ade_cpa  = (ade_cpa_i  + ade_cpa_j)  / 2
+        advantage     = pair_ade_lstm - pair_ade_cpa   # θετικό = CPA-GRN καλύτερο
+
+        agg_lstm, agg_cpa = scene_aggregate_ade(result, N)
+
+        evaluated.append({
+            **c, 'N': N, 'result': result,
+            'ade_lstm_i': ade_lstm_i, 'ade_cpa_i': ade_cpa_i,
+            'ade_lstm_j': ade_lstm_j, 'ade_cpa_j': ade_cpa_j,
+            'advantage': advantage,
+            'agg_lstm': agg_lstm, 'agg_cpa': agg_cpa,
+        })
+
+    print(f'{"scene":>6} {"N":>4} {"DCPA":>7} {"TCPA":>6} | '
+          f'{"pair LSTM":>10} {"pair CPA":>10} {"advantage":>10} | '
+          f'{"scene LSTM":>11} {"scene CPA":>10}')
+    for e in sorted(evaluated, key=lambda x: -x['advantage']):
+        print(f"{e['scene_idx']:>6} {e['N']:>4} {e['dcpa']:>7.4f} {e['tcpa']:>6.2f} | "
+              f"{(e['ade_lstm_i']+e['ade_lstm_j'])/2:>10.5f} "
+              f"{(e['ade_cpa_i']+e['ade_cpa_j'])/2:>10.5f} "
+              f"{e['advantage']:>+10.5f} | "
+              f"{e['agg_lstm']:>11.5f} {e['agg_cpa']:>10.5f}")
+
+    best = sorted(evaluated, key=lambda x: -x['advantage'])[:args.top_n]
+    n_wins = sum(1 for e in evaluated if e['advantage'] > 0)
+    print(f"\n{n_wins}/{len(evaluated)} υποψήφια σενάρια δείχνουν CPA-GRN καλύτερο "
+          f"(θετικό advantage) στο επιλεγμένο ζεύγος.")
+    if n_wins == 0:
+        print('⚠ ΚΑΝΕΝΑ σενάριο σύγκλισης στη δεξαμενή δεν δείχνει CPA-GRN καλύτερο.')
+        print('  Μην διαλέξεις κανένα από αυτά ως "success story" — θα ήταν παραπλανητικό.')
+        print('  Δες τη συζήτηση παρακάτω για εναλλακτική τίμια παρουσίαση.')
+
+    print('\nΠαραγωγή plots για τα top candidates κατά advantage...')
+    for rank, e in enumerate(best, 1):
+        out_path = os.path.join(args.out_dir, f'convergence_{rank}_scene{e["scene_idx"]}')
+        plot_scene(e['result'], e['i'], e['j'], e['dcpa'], e['tcpa'],
+                   out_path, include_smchn=args.include_smchn)
+        print(f"  [{rank}] scene={e['scene_idx']} advantage={e['advantage']:+.5f} → {out_path}.png")
+
+    print(f'\nΈτοιμο. Έλεγξε τον πίνακα παραπάνω πριν κοιτάξεις τα plots — '
+          f'το "advantage" και το "n_wins" λένε αν υπάρχει καθόλου τίμιο success story.')
 
 
 if __name__ == '__main__':
