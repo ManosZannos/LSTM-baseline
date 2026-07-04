@@ -313,7 +313,7 @@ def plot_scene(result, i, j, dcpa, tcpa, out_path, include_smchn):
     lstm_lon, lstm_lat = result['lstm_lonlat']
     cpa_lon,  cpa_lat  = result['cpagrn_lonlat']
 
-    fig, ax = plt.subplots(figsize=(8, 7))
+    fig, ax = plt.subplots(figsize=(10, 7.5))
 
     # Context: όλα τα άλλα πλοία της σκηνής, μόνο η τελευταία παρατηρούμενη
     # θέση τους, ως αχνά γκρι σημεία (δείχνει την πυκνότητα του σκηνικού
@@ -382,15 +382,16 @@ def plot_scene(result, i, j, dcpa, tcpa, out_path, include_smchn):
     ade_lstm_j = ade_degrees(lstm_lon, lstm_lat, gt_lon, gt_lat, j)
     ade_cpa_j  = ade_degrees(cpa_lon,  cpa_lat,  gt_lon, gt_lat, j)
 
-    title = (f'Σενάριο σύγκλισης — DCPA={dcpa:.2f} nm   TCPA={tcpa:.1f} min\n'
+    dcpa_m = dcpa * 1852.0   # nm → μέτρα, πιο κατανοητό σε τόσο μικρές αποστάσεις
+    title = (f'Σενάριο σύγκλισης — DCPA={dcpa_m:.1f} m   TCPA={tcpa:.1f} min\n'
              f'ADE Πλοίο A: LSTM={ade_lstm_i:.5f}° CPA-GRN={ade_cpa_i:.5f}°   |   '
              f'ADE Πλοίο B: LSTM={ade_lstm_j:.5f}° CPA-GRN={ade_cpa_j:.5f}°')
-    ax.set_title(title, fontsize=10)
+    ax.set_title(title, fontsize=9)
     ax.set_xlabel('Γεωγραφικό μήκος (LON, °)')
     ax.set_ylabel('Γεωγραφικό πλάτος (LAT, °)')
-    ax.legend(fontsize=7, loc='best', ncol=2)
+    ax.legend(fontsize=7, loc='upper center', bbox_to_anchor=(0.5, -0.12), ncol=4)
     ax.set_aspect('equal', adjustable='datalim')
-    fig.tight_layout()
+    fig.tight_layout(rect=[0, 0.08, 1, 0.94])
 
     fig.savefig(out_path + '.png', dpi=300)
     fig.savefig(out_path + '.pdf')
