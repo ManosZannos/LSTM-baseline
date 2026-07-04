@@ -121,15 +121,17 @@ def main():
     results['CPA-GRN v4'] = (ms, sd)
     del cpagrn
 
-    # 4. SMCHN
+   # 4. SMCHN
     print('\nTiming SMCHN...')
     try:
-        from model_smchn import SMCHN
+        from model_smchn import TrajectoryModel
         ckpt = torch.load('checkpoints/SMCHN_obs10_pred10_s42/val_best.pth',
                           map_location=device, weights_only=False)
-        saved = ckpt.get('args', {})
-        smchn = SMCHN(**{k: v for k, v in saved.items()
-                         if k in ['obs_len', 'pred_len']}).to(device)
+        smchn = TrajectoryModel(
+            obs_len=10, pred_len=10,
+            embedding_dims=64, number_gcn_layers=1,
+            dropout=0, num_heads=4
+        ).to(device)
         smchn.load_state_dict(ckpt['model'])
         smchn.eval()
         print(f'  Loaded SMCHN_obs10_pred10_s42  (epoch {ckpt["epoch"]})')
